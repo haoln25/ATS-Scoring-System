@@ -4,9 +4,25 @@ import re
 from typing import Tuple, Dict, List
 from pathlib import Path
 
-import spacy
-import pdfplumber
-from docx import Document
+# Optional imports
+spacy = None
+pdfplumber = None
+Document = None
+
+try:
+    import spacy
+except ImportError:
+    pass
+
+try:
+    import pdfplumber
+except ImportError:
+    pass
+
+try:
+    from docx import Document
+except ImportError:
+    pass
 
 class CVParserError(Exception):
     pass
@@ -104,51 +120,65 @@ def normalize_whitespace(text: str) -> str:
 
 
 class CVParser:
-    def __init__(self, model_name: str = "en_core_web_md"):
-        try:
-            self.nlp = spacy.load(model_name)
-        except OSError:
-            raise CVParserError(f"Missing {model_name}. Run: python -m spacy download {model_name}")
+    def __init__(self, nlp=None):
+        """
+        Initialize CVParser with optional spacy model.
+        If nlp is None, some methods will be disabled.
+        """
+        self.nlp = nlp
 
     def extract_text(self, file_path: str) -> str:
         path = Path(file_path)
         ext = path.suffix.lower()
         if ext == '.pdf':
+            if pdfplumber is None:
+                raise ImportError("pdfplumber is required for PDF parsing. Install it with: pip install pdfplumber")
             with pdfplumber.open(file_path) as pdf:
                 return "\n".join(page.extract_text() or '' for page in pdf.pages)
         elif ext == '.docx':
+            if Document is None:
+                raise ImportError("python-docx is required for DOCX parsing. Install it with: pip install python-docx")
             return "\n".join(p.text for p in Document(file_path).paragraphs)
         else:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
 
     def get_tokens(self, text: str) -> List[str]:
+        if self.nlp is None:
+            return text.split()
         return [t.text for t in self.nlp(text)]
 
     def get_sentences(self, text: str) -> List[str]:
+        if self.nlp is None:
+            return [s.strip() for s in text.split('\n') if s.strip()]
         return [s.text.strip() for s in self.nlp(text).sents]
 
     def remove_stopwords(self, text: str) -> str:
+        if self.nlp is None:
+            return text
         return " ".join(t.text for t in self.nlp(text) if not t.is_stop and not t.is_punct)
 
     def get_lemmas(self, text: str) -> List[str]:
+        if self.nlp is None:
+            return text.split()
         return [t.lemma_ for t in self.nlp(text) if not t.is_stop and not t.is_punct]
 
     def mask_pii(self, text: str) -> str:
         text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
         text = re.sub(r'\+?\d{1,3}[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}', '[PHONE]', text)
         
-        entities = []
-        for ent in self.nlp(text).ents:
-            if ent.label_ == 'PERSON':
-                low = ent.text.lower()
-                if not any(kw in low for kw in TECH_WHITELIST) and not any(kw in low for kw in NER_SKIP_PHRASES):
-                    entities.append((ent.start_char, ent.end_char))
-        
-        for start, end in sorted(entities, reverse=True):
-            original_text = text[start:end]
-            newlines = '\n' * original_text.count('\n')
-            text = text[:start] + '[PERSON]' + newlines + text[end:]
+        if self.nlp is not None:
+            entities = []
+            for ent in self.nlp(text).ents:
+                if ent.label_ == 'PERSON':
+                    low = ent.text.lower()
+                    if not any(kw in low for kw in TECH_WHITELIST) and not any(kw in low for kw in NER_SKIP_PHRASES):
+                        entities.append((ent.start_char, ent.end_char))
+            
+            for start, end in sorted(entities, reverse=True):
+                original_text = text[start:end]
+                newlines = '\n' * original_text.count('\n')
+                text = text[:start] + '[PERSON]' + newlines + text[end:]
             
         return text
 
@@ -185,5 +215,7 @@ class CVParser:
         
         return clean_full, masked_sections
 
-def parse_cv(file_path: str) -> Tuple[str, Dict[str, str]]:
-    return CVParser().parse_cv(file_path)
+
+def parse_cv(file_path: str, nlp=None) -> Tuple[str, Dict[str, str]]:
+    """Parse CV file. nlp parameter is optional (spacy model)."""
+    return CVParser(nlp=nlp).parse_cv(file_path)
