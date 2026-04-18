@@ -23,6 +23,36 @@ from core.cv_parser import (
 )
 from core.ats_scorer import ATSScorer, SEMANTIC_MATCH_THRESHOLD
 
+# ---------------------------------------------------------------------------
+# Compatibility shim:
+# `core/inference_pipeline.py` imports legacy functions from `core/ats_scorer.py`.
+# This Streamlit app uses `ATSScorer` directly, but we define fallbacks here so
+# `core/inference_pipeline.py` can be imported without modifying core modules.
+# ---------------------------------------------------------------------------
+import core.ats_scorer as _ats_scorer_module
+
+if not hasattr(_ats_scorer_module, "calculate_ats_score"):
+    def _calculate_ats_score_legacy(*_args, **_kwargs):  # type: ignore[no-redef]
+        raise NotImplementedError(
+            "Legacy calculate_ats_score() is not used by app.py. "
+            "This project scores via ATSScorer (semantic scoring)."
+        )
+
+    _ats_scorer_module.calculate_ats_score = _calculate_ats_score_legacy  # type: ignore[attr-defined]
+
+if not hasattr(_ats_scorer_module, "get_missing_keywords"):
+    def _get_missing_keywords_legacy(*_args, **_kwargs):  # type: ignore[no-redef]
+        return {}
+
+    _ats_scorer_module.get_missing_keywords = _get_missing_keywords_legacy  # type: ignore[attr-defined]
+
+from core.inference_pipeline import (
+    ATSInferencePipeline,
+    preprocess_text as preprocess_text_for_ner,
+    merge_entities as merge_ner_entities,
+    postprocess_entities as postprocess_ner_entities,
+)
+
 load_dotenv()
 
 st.set_page_config(
@@ -127,6 +157,56 @@ def dedupe_entities(entities: list[dict]) -> list[dict]:
     return out
 
 
+def normalize_entity_label(label: str) -> str:
+    """Normalize labels across BERT/spaCy/rules so UI grouping is consistent."""
+    raw = (label or "").strip()
+    if not raw:
+        return ""
+
+    key = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+    mapping = {
+        "skills": "SKILLS",
+        "skill": "SKILLS",
+        "email address": "EMAIL_ADDRESS",
+        "email": "EMAIL_ADDRESS",
+        "links": "LINKS",
+        "link": "LINKS",
+        "graduation year": "GRADUATION_YEAR",
+        "years of experience": "YEARS_OF_EXPERIENCE",
+        "year of experience": "YEARS_OF_EXPERIENCE",
+        "companies worked at": "COMPANIES_WORKED_AT",
+        "company": "COMPANIES_WORKED_AT",
+        "college name": "COLLEGE_NAME",
+        "location": "LOCATION",
+        "name": "NAME",
+        "designation": "DESIGNATION",
+        "projects": "PROJECTS",
+        "certifications": "CERTIFICATIONS",
+        "languages": "LANGUAGES",
+    }
+    if key in mapping:
+        return mapping[key]
+
+    # Default: upper snake-case
+    return re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_")
+
+
+def normalize_entities(entities: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for ent in entities:
+        label = normalize_entity_label(str(ent.get("label", "")))
+        text = str(ent.get("text", "")).strip()
+        if not label or not text:
+            continue
+        confidence = float(ent.get("confidence", 0.6) or 0.6)
+        normalized.append({
+            "label": label,
+            "text": text,
+            "confidence": confidence,
+        })
+    return dedupe_entities(normalized)
+
+
 @st.cache_resource(show_spinner=False)
 def get_spacy_nlp(model_name: str):
     import spacy
@@ -169,6 +249,17 @@ def get_ats_scorer(skill_threshold: float) -> ATSScorer:
     return ATSScorer(threshold=skill_threshold)
 
 
+@st.cache_resource(show_spinner=False)
+def get_ner_pipeline(
+    bert_model_dir: Optional[str],
+    spacy_model_name: Optional[str],
+) -> ATSInferencePipeline:
+    return ATSInferencePipeline(
+        bert_model_dir=bert_model_dir,
+        spacy_model_name=spacy_model_name,
+    )
+
+
 def run_analysis(
     cv_text: str,
     jd_text: str,
@@ -176,6 +267,9 @@ def run_analysis(
     skill_threshold: float,
     use_spacy: bool,
     spacy_model_name: Optional[str],
+    use_bert: bool,
+    bert_model_dir: Optional[str],
+    bert_use_rule_fallback: bool,
 ) -> dict[str, Any]:
     cv_clean = clean_text(cv_text)
     jd_clean = clean_text(jd_text)
@@ -183,8 +277,104 @@ def run_analysis(
     parser = CVParser()
     cv_sections = parser.extract_sections(cv_clean)
 
+    # High-precision fields (for UI + missing keyword suggestions)
+    emails = _dedupe_preserve_order(EMAIL_RE.findall(cv_clean))
+    links = _dedupe_preserve_order(LINK_RE.findall(cv_clean))
+
+    # -------------------------------------------------------------------
+    # NER / Entity extraction
+    # - BERT (Member 1/3) via `core/inference_pipeline.py`
+    # - spaCy optional (Member 2)
+    # -------------------------------------------------------------------
+    cv_entities: list[dict] = []
+    jd_entities: list[dict] = []
+    bert_cv_skills: list[str] = []
+    bert_jd_skills: list[str] = []
+
+    if use_bert:
+        try:
+            # If a path was provided, check it before attempting to load weights.
+            if bert_model_dir and not Path(bert_model_dir).exists():
+                raise FileNotFoundError(f"BERT model directory not found: {bert_model_dir}")
+
+            cv_for_ner = preprocess_text_for_ner(cv_text)
+            jd_for_ner = preprocess_text_for_ner(jd_text)
+
+            pipeline = get_ner_pipeline(
+                bert_model_dir=bert_model_dir,
+                spacy_model_name=spacy_model_name if use_spacy else None,
+            )
+
+            cv_spacy = pipeline.extract_with_spacy(cv_for_ner) if pipeline.spacy_extractor is not None else []
+            jd_spacy = pipeline.extract_with_spacy(jd_for_ner) if pipeline.spacy_extractor is not None else []
+
+            cv_bert = pipeline.extract_with_bert(cv_for_ner, use_rule_fallback=bert_use_rule_fallback)
+            jd_bert = pipeline.extract_with_bert(jd_for_ner, use_rule_fallback=bert_use_rule_fallback)
+
+            if cv_spacy or jd_spacy:
+                cv_entities = merge_ner_entities(cv_spacy, cv_bert)
+                jd_entities = merge_ner_entities(jd_spacy, jd_bert)
+            else:
+                cv_entities = postprocess_ner_entities(cv_bert)
+                jd_entities = postprocess_ner_entities(jd_bert)
+
+            cv_entities = normalize_entities(cv_entities)
+            jd_entities = normalize_entities(jd_entities)
+            bert_cv_skills = [e["text"] for e in cv_entities if e.get("label") == "SKILLS"]
+            bert_jd_skills = [e["text"] for e in jd_entities if e.get("label") == "SKILLS"]
+        except Exception as e:
+            st.warning(
+                "BERT NER could not be loaded/used for this run. "
+                f"Falling back to rule-based skills and optional spaCy. Details: {e}"
+            )
+            use_bert = False
+            cv_entities = []
+            jd_entities = []
+            bert_cv_skills = []
+            bert_jd_skills = []
+
+    if not use_bert:
+        if use_spacy and spacy_model_name:
+            cv_entities = normalize_entities(extract_spacy_entities(cv_clean, spacy_model_name))
+            jd_entities = normalize_entities(extract_spacy_entities(jd_clean, spacy_model_name))
+
+        # Rule-based skills (fast fallback)
+        cv_skills_fallback = extract_skill_tokens(cv_sections.get("SKILLS", ""))
+        jd_skills_fallback = extract_skill_tokens(jd_clean)
+        cv_entities = normalize_entities(
+            cv_entities + [{"label": "SKILLS", "text": s, "confidence": 0.7} for s in cv_skills_fallback]
+        )
+        jd_entities = normalize_entities(
+            jd_entities + [{"label": "SKILLS", "text": s, "confidence": 0.7} for s in jd_skills_fallback]
+        )
+
+    # Add a couple of simple, high-precision entities for display/suggestions
+    if emails:
+        cv_entities = normalize_entities(
+            cv_entities + [{"label": "EMAIL_ADDRESS", "text": e, "confidence": 0.95} for e in emails[:3]]
+        )
+    if links:
+        cv_entities = normalize_entities(
+            cv_entities + [{"label": "LINKS", "text": l, "confidence": 0.9} for l in links[:3]]
+        )
+
+    # -------------------------------------------------------------------
+    # Scoring (Member 4) — semantic scoring + skill matching
+    # We incorporate BERT-extracted skills into scoring by feeding them into
+    # the CV skill section and JD skill list.
+    # -------------------------------------------------------------------
+    if bert_cv_skills:
+        merged_cv_skills = _dedupe_preserve_order(
+            extract_skill_tokens(cv_sections.get("SKILLS", "")) + bert_cv_skills
+        )
+        cv_sections["SKILLS"] = ", ".join(merged_cv_skills)
+
     scorer = get_ats_scorer(skill_threshold)
-    ats_result = scorer.score(cv_sections=cv_sections, jd_text=jd_clean)
+    ats_result = scorer.score(
+        cv_sections=cv_sections,
+        jd_text=jd_clean,
+        jd_skills=bert_jd_skills or None,
+    )
     ats_dict = ats_result.to_dict()
 
     ats_score = int(round(float(ats_dict.get("total_score", 0.0))))
@@ -229,32 +419,9 @@ def run_analysis(
             )
         return "\n".join(lines)
 
-    # Build basic entities for UI (skills + a few PII-like fields from CV)
-    cv_skills = extract_skill_tokens(cv_sections.get("SKILLS", ""))
-    jd_skills = [d.get("jd_skill") for d in skill_details if d.get("jd_skill")]
-    jd_skills = _dedupe_preserve_order([str(s) for s in jd_skills])
-
-    cv_entities: list[dict] = [
-        {"label": "SKILLS", "text": s, "confidence": 0.7} for s in cv_skills
-    ]
-    jd_entities: list[dict] = [
-        {"label": "SKILLS", "text": s, "confidence": 0.7} for s in jd_skills
-    ]
-
-    emails = _dedupe_preserve_order(EMAIL_RE.findall(cv_clean))
-    for email in emails[:3]:
-        cv_entities.append({"label": "EMAIL_ADDRESS", "text": email, "confidence": 0.9})
-
-    links = _dedupe_preserve_order(LINK_RE.findall(cv_clean))
-    for link in links[:3]:
-        cv_entities.append({"label": "LINKS", "text": link, "confidence": 0.85})
-
-    if use_spacy and spacy_model_name:
-        cv_entities.extend(extract_spacy_entities(cv_clean, spacy_model_name))
-        jd_entities.extend(extract_spacy_entities(jd_clean, spacy_model_name))
-
-    cv_entities = dedupe_entities(cv_entities)
-    jd_entities = dedupe_entities(jd_entities)
+    # Final cleanup/deduping for UI
+    cv_entities = normalize_entities(cv_entities)
+    jd_entities = normalize_entities(jd_entities)
 
     score_explanation = {
         "Total": f"{ats_score}/100",
@@ -281,6 +448,8 @@ def run_analysis(
         "matched_skills": matched_skills,
         "missing_keywords": missing_keywords,
         "skill_details": skill_details,
+        "bert_enabled": bool(use_bert),
+        "bert_model_dir": bert_model_dir,
     }
 
 def extract_text_from_pdf(pdf_file) -> str:
@@ -586,6 +755,42 @@ def main():
     st.markdown("*Analyze your CV against job descriptions using AI-powered NER (Spacy + BERT)*")
     with st.sidebar:
         st.header("Configuration")
+
+        use_bert = st.checkbox(
+            "Enable BERT NER",
+            value=True,
+            help="Use the Member 3 BERT NER model for entity extraction. Requires local model weights.",
+        )
+
+        default_bert_dir = str((Path(__file__).parent / "models" / "bert").resolve())
+        bert_model_dir_input = st.text_input(
+            "BERT model directory",
+            value=default_bert_dir,
+            help="Folder containing the fine-tuned BERT NER model (config.json, tokenizer files, model weights).",
+        ).strip()
+
+        bert_use_rule_fallback = st.checkbox(
+            "Use rule-based fallback if BERT fails",
+            value=True,
+            help="If BERT weights cannot be loaded, still extract common skills using rule-based matching.",
+        )
+
+        bert_model_dir: Optional[str]
+        if bert_model_dir_input:
+            bert_path = Path(bert_model_dir_input)
+            if not bert_path.is_absolute():
+                bert_path = (Path(__file__).parent / bert_path).resolve()
+            bert_model_dir = str(bert_path)
+        else:
+            bert_model_dir = None
+
+        use_bert_effective = use_bert
+        if use_bert and bert_model_dir and not Path(bert_model_dir).exists():
+            st.warning(
+                f"BERT model directory not found: {bert_model_dir}. "
+                "BERT NER will be disabled for this run."
+            )
+            use_bert_effective = False
         
         use_spacy = st.checkbox(
             "Enable Spacy NER",
@@ -625,36 +830,22 @@ def main():
         )
 
         if provider == "OpenAI (ChatGPT)":
-            default_key = os.getenv("OPENAI_API_KEY", "")
             default_model = "gpt-4o-mini"
-            api_help = "Enter OpenAI API key or set OPENAI_API_KEY"
+            llm_api_key = os.getenv("OPENAI_API_KEY", "")
+            api_help = "Set OPENAI_API_KEY (or use a .env file) to enable OpenAI calls."
         else:
-            default_key = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
             default_model = "gemini-1.5-flash"
-            api_help = "Enter Gemini API key or set GEMINI_API_KEY / GOOGLE_API_KEY"
+            llm_api_key = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+            api_help = "Set GEMINI_API_KEY or GOOGLE_API_KEY (or use a .env file) to enable Gemini calls."
 
-        llm_model_name = st.text_input("Model name", value=default_model).strip()
-        llm_api_key = st.text_input("API Key", value=default_key, type="password", help=api_help)
-        enable_llm_fallback = st.checkbox(
-            "Enable provider fallback",
-            value=True,
-            help="If the selected provider fails, automatically retry with the other provider."
+        llm_model_name = default_model
+        st.text_input(
+            "Model name",
+            value=default_model,
+            disabled=True,
+            help="Default model for the selected provider (read-only).",
         )
-        
-        st.divider()
-        st.markdown("### About")
-        st.markdown("""
-        This ATS system uses:
-        - **Spacy NER** for linguistic entity extraction
-        - **Semantic scoring** (Sentence-Transformers with TF-IDF fallback)
-        - **Skill matching** (exact/synonym/semantic)
-        
-        **Score Calculation:**
-        - Skills: 45%
-        - Experience: 30%
-        - Education: 15%
-        - Summary: 10%
-        """)
+        enable_llm_fallback = False
     # Input section
     st.header("Input")
     
@@ -705,7 +896,7 @@ def main():
         
         with st.spinner("Scoring CV against Job Description..."):
             try:
-                # Use Member 4 scorer for stable ATS + skill match (no BERT weights required).
+                # Member 4 scorer for ATS + skill match; optionally enhanced with Member 3 BERT skills.
                 skill_threshold = float(
                     max(0.0, min(1.0, conf_threshold if conf_threshold is not None else SEMANTIC_MATCH_THRESHOLD))
                 )
@@ -715,6 +906,9 @@ def main():
                     skill_threshold=skill_threshold,
                     use_spacy=use_spacy,
                     spacy_model_name=spacy_model if use_spacy else None,
+                    use_bert=use_bert_effective,
+                    bert_model_dir=bert_model_dir,
+                    bert_use_rule_fallback=bert_use_rule_fallback,
                 )
             except Exception as e:
                 st.error(f"Error during analysis: {e}")
@@ -815,7 +1009,10 @@ def main():
         with tab5:
             st.subheader("AI CV Review and Learning Roadmap")
             if not llm_api_key:
-                st.info("Enter API key in the sidebar to enable GenAI analysis.")
+                st.info(
+                    "LLM API key is not configured. Set OPENAI_API_KEY or GEMINI_API_KEY/GOOGLE_API_KEY "
+                    "(for example in a .env file) to enable GenAI analysis."
+                )
             else:
                 if not llm_model_name.strip():
                     st.error("Model name is required for LLM generation.")
